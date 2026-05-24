@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
     "torch>=2.4",
-    "triton>=3.0",
+    "triton>=3.0; platform_system != 'Windows'",
     "safetensors>=0.4",
 ]
 
