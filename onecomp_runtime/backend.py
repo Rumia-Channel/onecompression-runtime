@@ -18,6 +18,7 @@ from typing import Any
 
 import torch
 
+from .device import supports_gemlite, supports_triton
 from .layers.fused_int4_linear import FusedInt4Linear
 from .layers.gemlite_int4_linear import GemLiteInt4Linear, gemlite_available
 from .quant_utils import dequant_gptq_to_fp
@@ -52,22 +53,40 @@ def can_use_fused(entry: dict[str, Any]) -> bool:
     )
 
 
-def resolve_backend(backend: str | None, use_fused: bool = True) -> str:
+def resolve_backend(
+    backend: str | None,
+    use_fused: bool = True,
+    device: str | torch.device | None = None,
+) -> str:
     """Pick the int4 GEMM backend.
 
     ``backend`` takes precedence; ``use_fused=False`` (legacy) forces eager.
-    ``"auto"`` prefers GemLite when importable (within ~15% of bf16 at large-M
-    shapes), then the fused Triton kernel, else eager.
+    ``"auto"`` prefers GemLite on CUDA when importable (within ~15% of bf16 at
+    large-M shapes), then the bundled Triton kernel on CUDA/XPU, else eager.
     """
     if not use_fused:
         return "eager"
+    dev = torch.device(device) if device is not None else None
     b = (backend or "auto").lower()
     if b == "auto":
-        return "gemlite" if gemlite_available() else "fused"
-    if b == "gemlite" and not gemlite_available():
+        if dev is not None and supports_gemlite(dev) and gemlite_available():
+            return "gemlite"
+        if dev is None or supports_triton(dev):
+            return "fused"
+        return "eager"
+    if b == "gemlite":
+        if dev is not None and not supports_gemlite(dev):
+            raise RuntimeError(
+                f"backend='gemlite' is only supported on CUDA devices, got {dev}"
+            )
+        if not gemlite_available():
+            raise RuntimeError(
+                "backend='gemlite' requested but the 'gemlite' package is not "
+                "importable; pip install gemlite or use backend='fused'"
+            )
+    if b == "fused" and dev is not None and not supports_triton(dev):
         raise RuntimeError(
-            "backend='gemlite' requested but the 'gemlite' package is not "
-            "importable; pip install gemlite or use backend='fused'"
+            f"backend='fused' requires a Triton-capable CUDA/XPU device, got {dev}"
         )
     if b not in ("gemlite", "fused", "eager"):
         raise ValueError(f"unknown backend: {backend!r}")

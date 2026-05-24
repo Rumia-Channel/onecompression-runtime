@@ -23,9 +23,154 @@ These cover 100% of the moespeech_ft_5000 quantized-DiT layers.
 """
 from __future__ import annotations
 
+import time
+
 import torch
 import triton
 import triton.language as tl
+
+from ..device import synchronize
+
+
+def _select_cuda_launch_config(M: int, N: int, K: int) -> tuple[int, int, int, int, int]:
+    # Heuristic from RTX 3090 sweep across production DiT shapes; small-M
+    # memory-bound regime favours nkg=8 (K_BLK=256) where it wins. K may be
+    # padded to a multiple of 256 by FusedInt4Linear.__init__.
+    if M <= 32:
+        BLOCK_M, BLOCK_N, num_warps, num_stages = 32, 32, 2, 4
+    elif M <= 128:
+        if N >= 2048:
+            BLOCK_M, BLOCK_N, num_warps, num_stages = 32, 32, 4, 2
+        else:
+            BLOCK_M, BLOCK_N, num_warps, num_stages = 32, 32, 4, 3
+    elif M <= 256:
+        if N >= 2048:
+            BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 32, 4, 3
+        else:
+            BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 32, 4, 3
+    elif M <= 1024:
+        BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 2
+    elif N >= 2048 and K <= 1536:
+        BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 64, 4, 2
+    else:
+        BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 2
+
+    if BLOCK_M * BLOCK_N <= 1024 and K % 256 == 0:
+        NUM_K_GROUPS = 8
+    elif K % 128 == 0:
+        NUM_K_GROUPS = 4
+    elif K % 64 == 0:
+        NUM_K_GROUPS = 2
+    else:
+        NUM_K_GROUPS = 1
+
+    # Occupancy caps from CUDA sweep; large-M and wide-N shapes prefer less K
+    # per CTA despite the extra dequant loop iterations.
+    if M > 1024:
+        if N >= 2048 and K <= 1536:
+            NUM_K_GROUPS = min(NUM_K_GROUPS, 2)
+        else:
+            NUM_K_GROUPS = 1
+    elif 128 < M <= 256:
+        if N >= 2048:
+            NUM_K_GROUPS = 1
+        else:
+            NUM_K_GROUPS = min(NUM_K_GROUPS, 2)
+    elif M <= 128 and N >= 2048:
+        NUM_K_GROUPS = min(NUM_K_GROUPS, 4)
+    return BLOCK_M, BLOCK_N, num_warps, num_stages, NUM_K_GROUPS
+
+
+def _select_xpu_launch_config(M: int, N: int, K: int) -> tuple[int, int, int, int, int]:
+    # Intel GPUs generally benefit from wider N tiles and shallow pipelining for
+    # this kernel: dequant dominates shared-memory/register pressure, while XMX
+    # dot throughput wants fewer tiny CTAs than the CUDA small-M sweep selected.
+    #
+    # These are conservative XPU defaults, kept separate from the CUDA sweep so
+    # per-device benchmarking can tune them without regressing NVIDIA kernels.
+    if M <= 32:
+        BLOCK_M, BLOCK_N, num_warps, num_stages = 16, 64, 4, 2
+    elif M <= 128:
+        BLOCK_M, BLOCK_N, num_warps, num_stages = 32, 64, 8, 2
+    elif M <= 256:
+        BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 8, 2
+    elif M <= 1024:
+        BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 128, 8, 2
+    elif N >= 2048 and K <= 1536:
+        BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 128, 8, 2
+    else:
+        BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 64, 8, 2
+
+    tile_area = BLOCK_M * BLOCK_N
+    if tile_area <= 2048 and K % 128 == 0:
+        NUM_K_GROUPS = 4
+    elif K % 64 == 0:
+        NUM_K_GROUPS = 2
+    else:
+        NUM_K_GROUPS = 1
+
+    # Cap very large-M occupancy pressure; XPU register pressure from dequant
+    # is more sensitive to K_BLK than the CUDA Ampere-tuned path.
+    if M > 1024:
+        NUM_K_GROUPS = min(NUM_K_GROUPS, 2)
+    return BLOCK_M, BLOCK_N, num_warps, num_stages, NUM_K_GROUPS
+
+
+def _valid_num_k_groups(K: int, tile_area: int, prefer: int) -> int:
+    for nkg in (prefer, 8, 4, 2, 1):
+        if nkg <= 0:
+            continue
+        if K % (nkg * 32) == 0:
+            if nkg == 8 and tile_area > 2048:
+                continue
+            return nkg
+    return 1
+
+
+def _xpu_candidate_launch_configs(M: int, N: int, K: int) -> list[tuple[int, int, int, int, int]]:
+    base = _select_xpu_launch_config(M, N, K)
+    shapes: list[tuple[int, int, int, int, int]] = [
+        base,
+        (16, 64, 4, 2, 4),
+        (32, 32, 4, 2, 4),
+        (32, 64, 8, 2, 4),
+        (64, 64, 8, 2, 2),
+        (64, 128, 8, 2, 2),
+        (128, 64, 8, 2, 1),
+        (128, 128, 8, 2, 1),
+    ]
+    if M <= 128:
+        shapes.extend([
+            (16, 128, 8, 2, 2),
+            (32, 128, 8, 2, 2),
+        ])
+    if N >= 2048:
+        shapes.extend([
+            (32, 128, 8, 2, 2),
+            (64, 128, 8, 2, 2),
+            (128, 128, 8, 2, 1),
+        ])
+
+    out: list[tuple[int, int, int, int, int]] = []
+    seen: set[tuple[int, int, int, int, int]] = set()
+    for bm, bn, nw, ns, prefer_nkg in shapes:
+        nkg = _valid_num_k_groups(K, bm * bn, prefer_nkg)
+        cfg = (bm, bn, nw, ns, nkg)
+        if cfg not in seen:
+            seen.add(cfg)
+            out.append(cfg)
+    return out
+
+
+def _select_launch_config(
+    device_type: str,
+    M: int,
+    N: int,
+    K: int,
+) -> tuple[int, int, int, int, int]:
+    if device_type == "xpu":
+        return _select_xpu_launch_config(M, N, K)
+    return _select_cuda_launch_config(M, N, K)
 
 
 @triton.jit
@@ -240,43 +385,9 @@ def fused_int4_gemm(
         bias_h = torch.empty(0, dtype=a.dtype, device=a.device)
         has_bias = False
 
-    # Manual config heuristic — chosen by full sweep on RTX 3090 across all
-    # production DiT shapes (M in {63, 76, 120, 189, 256, 360, 750, 768, 2250},
-    # K in {512, 768, 1280, 3680}, N in {1280, 3680}).
-    #
-    # Small-M shapes need many small tiles to saturate the 82 SMs of a 3090;
-    # large-M shapes prefer fatter M-tiles to amortise dequant overhead.
-    if M <= 32:
-        BLOCK_M, BLOCK_N, num_warps, num_stages = 32, 32, 2, 4
-    elif M <= 128:
-        BLOCK_M, BLOCK_N, num_warps, num_stages = 32, 32, 4, 3
-    elif M <= 256:
-        BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 32, 4, 3
-    elif M <= 1024:
-        BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 2
-    elif N >= 2048 and K <= 1536:
-        # (M=2250, K=1280, N=3680)-style: fat M-tile clears the win.
-        BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 64, 4, 2
-    else:
-        BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 2
-
-    # NUM_K_GROUPS controls how many GPTQ groups (each GROUPSIZE K rows) are
-    # consumed per outer loop iteration → tl.dot operates on K = NUM_K_GROUPS *
-    # GROUPSIZE.  K_BLK must divide K.  Larger K_BLK amortises load/launch
-    # overhead but consumes more shared memory (BM*K_BLK*2 + BN*K_BLK*2 per
-    # stage); RTX 3090 caps SMEM at ~100KB.  nkg=8 (K_BLK=256) wins at
-    # small-M tiles (BM*BN ≤ 1024) but exceeds SMEM at fat tiles.
-    tile_area = BLOCK_M * BLOCK_N
-    if tile_area <= 1024 and K % 256 == 0:
-        NUM_K_GROUPS = 8
-    elif tile_area <= 2048 and K % 128 == 0:
-        NUM_K_GROUPS = 4
-    elif K % 128 == 0:
-        NUM_K_GROUPS = 4
-    elif K % 64 == 0:
-        NUM_K_GROUPS = 2
-    else:
-        NUM_K_GROUPS = 1
+    BLOCK_M, BLOCK_N, num_warps, num_stages, NUM_K_GROUPS = _select_launch_config(
+        a.device.type, M, N, K
+    )
 
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
 
@@ -429,78 +540,84 @@ class FusedInt4Linear(torch.nn.Module):
         """Compute and cache the (BLOCK_M, BLOCK_N, num_warps, num_stages,
         NUM_K_GROUPS, grid) tuple for this layer at activation-shape M.
 
-        Heuristic from RTX 3090 sweep across production DiT shapes; small-M
-        memory-bound regime favours nkg=8 (K_BLK=256) which beats cuBLAS bf16
-        per-shape (11.7us vs 13us at M=63 K=N=1280). K is padded to a multiple
-        of 256 in __init__, so nkg=8 is always available regardless of the
-        layer's logical K.
+        CUDA and XPU use separate heuristics. CUDA keeps the RTX 3090 sweep
+        results; XPU uses wider-N, shallower-pipeline defaults intended for
+        Triton-XPU/XMX and can be tuned independently.
         """
         K = self._k_padded
         N = self.out_features
-        if M <= 32:
-            BLOCK_M, BLOCK_N, num_warps, num_stages = 32, 32, 2, 4
-        elif M <= 128:
-            if N >= 2048:
-                # Wide-N at M=63: nkg=8 (K_BLK=256) is wasteful; nkg=4 ns=2
-                # ties cuBLAS (26us vs 25us) where nkg=8 ran 36us.
-                BLOCK_M, BLOCK_N, num_warps, num_stages = 32, 32, 4, 2
-            else:
-                BLOCK_M, BLOCK_N, num_warps, num_stages = 32, 32, 4, 3
-        elif M <= 256:
-            if N >= 2048:
-                # Wide-N at M=256 (e.g., 256×1280×3680): tall tile boosts
-                # arithmetic intensity along K and lets nkg=1 pack more CTAs/SM.
-                # Sweep-best on RTX 3090: BM=128 BN=32 nkg=1 → 54us, beats
-                # cuBLAS 61us by 12%.
-                BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 32, 4, 3
-            else:
-                BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 32, 4, 3
-        elif M <= 1024:
-            BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 2
-        elif N >= 2048 and K <= 1536:
-            BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 64, 4, 2
-        else:
-            BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 2
-
-        tile_area = BLOCK_M * BLOCK_N
-        if tile_area <= 1024 and K % 256 == 0:
-            NUM_K_GROUPS = 8
-        elif K % 128 == 0:
-            NUM_K_GROUPS = 4
-        elif K % 64 == 0:
-            NUM_K_GROUPS = 2
-        else:
-            NUM_K_GROUPS = 1
-
-        # Occupancy cap for large M: each stage's SMEM scales with K_BLK, so a
-        # fatter K_BLK forces fewer CTAs/SM. For large M the kernel becomes
-        # occupancy-bound and lower nkg wins (stable bench on RTX 3090, M=2250):
-        #   K=N=1280:   nkg=1 134us beats nkg=2 141us
-        #   K=3680 N=1280: nkg=1 416us beats nkg=2 424us
-        # Wide-N (N>=2048) hits the BM=128 BN=64 branch and prefers nkg=2 there:
-        #   K=1280 N=3680: nkg=2 ≈ 387us beats nkg=1.
-        if M > 1024:
-            if N >= 2048 and K <= 1536:
-                NUM_K_GROUPS = min(NUM_K_GROUPS, 2)
-            else:
-                NUM_K_GROUPS = 1
-        elif 128 < M <= 256:
-            # Sweep on RTX 3090: nkg=4 (current default at this BM/BN) loses to
-            # nkg=2 by 4-6us across (256,3680,1280) and (256,1280,1280); for
-            # wide-N (N>=2048) the tall tile picked above prefers nkg=1.
-            if N >= 2048:
-                NUM_K_GROUPS = 1
-            else:
-                NUM_K_GROUPS = min(NUM_K_GROUPS, 2)
-        elif M <= 128 and N >= 2048:
-            # Small-M wide-N: nkg=4 (K_BLK=128) ties cuBLAS where nkg=8 lags
-            # 40%. With ns=2 (set above) SMEM fits well.
-            NUM_K_GROUPS = min(NUM_K_GROUPS, 4)
+        BLOCK_M, BLOCK_N, num_warps, num_stages, NUM_K_GROUPS = _select_launch_config(
+            self.qweight.device.type, M, N, K
+        )
 
         grid = ((M + BLOCK_M - 1) // BLOCK_M * ((N + BLOCK_N - 1) // BLOCK_N),)
         cfg = (BLOCK_M, BLOCK_N, num_warps, num_stages, NUM_K_GROUPS, grid)
         self._cfg_cache[M] = cfg
         return cfg
+
+    def _cfg_from_launch_params(
+        self,
+        M: int,
+        launch: tuple[int, int, int, int, int],
+    ) -> tuple:
+        BLOCK_M, BLOCK_N, num_warps, num_stages, NUM_K_GROUPS = launch
+        N = self.out_features
+        grid = ((M + BLOCK_M - 1) // BLOCK_M * ((N + BLOCK_N - 1) // BLOCK_N),)
+        return BLOCK_M, BLOCK_N, num_warps, num_stages, NUM_K_GROUPS, grid
+
+    def _bias_for(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        if self._has_bias:
+            return self.bias
+        cached = self._empty_bias
+        if cached is None or cached.dtype != dtype or cached.device != device:
+            cached = torch.empty(0, dtype=dtype, device=device)
+            self._empty_bias = cached
+        return cached
+
+    def _forward_2d_with_cfg(self, a_2d: torch.Tensor, M: int, cfg: tuple) -> torch.Tensor:
+        BLOCK_M, BLOCK_N, num_warps, num_stages, NUM_K_GROUPS, grid = cfg
+        bias_h = self._bias_for(a_2d.dtype, a_2d.device)
+
+        N = self.out_features
+        c = torch.empty((M, N), dtype=a_2d.dtype, device=a_2d.device)
+        _fused_int4_gemm_kernel[grid](
+            a_2d, self.qweight, self.scales, self.qzeros, bias_h, c,
+            M, N, self._k_padded,
+            a_2d.stride(0), a_2d.stride(1),
+            self.qweight.stride(0), self.qweight.stride(1),
+            self.scales.stride(0), self.scales.stride(1),
+            self.qzeros.stride(0), self.qzeros.stride(1),
+            c.stride(0), c.stride(1),
+            HAS_BIAS=self._has_bias,
+            GROUPSIZE=32,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+            NUM_K_GROUPS=NUM_K_GROUPS,
+            K_LOGICAL=self.in_features,
+            num_warps=num_warps, num_stages=num_stages,
+        )
+        return c
+
+    @torch.no_grad()
+    def _autotune_xpu_cfg(self, M: int, dtype: torch.dtype) -> tuple:
+        device = self.qweight.device
+        x = torch.zeros((M, self.in_features), dtype=dtype, device=device)
+        best_cfg: tuple | None = None
+        best_ms = float("inf")
+        for launch in _xpu_candidate_launch_configs(M, self.out_features, self._k_padded):
+            cfg = self._cfg_from_launch_params(M, launch)
+            _ = self._forward_2d_with_cfg(x, M, cfg)
+            synchronize(device)
+            t0 = time.perf_counter()
+            for _ in range(3):
+                _ = self._forward_2d_with_cfg(x, M, cfg)
+            synchronize(device)
+            ms = (time.perf_counter() - t0) * 1000.0 / 3.0
+            if ms < best_ms:
+                best_ms = ms
+                best_cfg = cfg
+        assert best_cfg is not None
+        self._cfg_cache[M] = best_cfg
+        return best_cfg
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Fast path: skip the public ``fused_int4_gemm`` wrapper's asserts,
@@ -523,37 +640,10 @@ class FusedInt4Linear(torch.nn.Module):
         cfg = self._cfg_cache.get(M)
         if cfg is None:
             cfg = self._build_cfg(M)
-        BLOCK_M, BLOCK_N, num_warps, num_stages, NUM_K_GROUPS, grid = cfg
-
-        if self._has_bias:
-            bias_h = self.bias
-        else:
-            cached = self._empty_bias
-            if cached is None or cached.dtype != x.dtype or cached.device != x.device:
-                cached = torch.empty(0, dtype=x.dtype, device=x.device)
-                self._empty_bias = cached
-            bias_h = cached
-
-        N = self.out_features
-        c = torch.empty((M, N), dtype=x.dtype, device=x.device)
-        _fused_int4_gemm_kernel[grid](
-            a_2d, self.qweight, self.scales, self.qzeros, bias_h, c,
-            M, N, self._k_padded,
-            a_2d.stride(0), a_2d.stride(1),
-            self.qweight.stride(0), self.qweight.stride(1),
-            self.scales.stride(0), self.scales.stride(1),
-            self.qzeros.stride(0), self.qzeros.stride(1),
-            c.stride(0), c.stride(1),
-            HAS_BIAS=self._has_bias,
-            GROUPSIZE=32,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-            NUM_K_GROUPS=NUM_K_GROUPS,
-            K_LOGICAL=self.in_features,
-            num_warps=num_warps, num_stages=num_stages,
-        )
+        c = self._forward_2d_with_cfg(a_2d, M, cfg)
         if x_dim == 2:
             return c
-        return c.reshape(*x.shape[:-1], N)
+        return c.reshape(*x.shape[:-1], self.out_features)
 
     @torch.no_grad()
     def warmup(self, m_values=(32, 128, 256, 1024, 2250)) -> None:
@@ -568,9 +658,12 @@ class FusedInt4Linear(torch.nn.Module):
         for m in m_values:
             if m <= 0:
                 continue
+            if device.type == "xpu":
+                self._autotune_xpu_cfg(int(m), dtype)
+                continue
             x = torch.zeros((int(m), self.in_features), dtype=dtype, device=device)
             _ = self.forward(x)
-        torch.cuda.synchronize() if device.type == "cuda" else None
+        synchronize(device)
 
     def _apply(self, fn, recurse=True):
         # Override _apply so .to(dtype=...) on the parent module doesn't cast our

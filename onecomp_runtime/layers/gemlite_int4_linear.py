@@ -14,6 +14,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from ..device import supports_gemlite
 from ..quant_utils import unpack_int_weights, unpack_zeros
 
 
@@ -51,6 +52,8 @@ class GemLiteInt4Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         dev = torch.device(device)
+        if not supports_gemlite(dev):
+            raise RuntimeError(f"GemLiteInt4Linear only supports CUDA devices, got {dev}")
         self._device = dev
 
         # (out, in) uint8 int weights, (out, num_groups) scales / zeros.

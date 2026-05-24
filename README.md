@@ -12,6 +12,12 @@ pip install onecomp-runtime[gemlite]     # + GemLite int4 kernels
 pip install onecomp-runtime[diffusion]   # + diffusers (generic loader builds diffusers classes)
 ```
 
+XPU is opt-in and needs the PyTorch XPU wheel index:
+
+```bash
+pip install onecomp-runtime[xpu] --index-url https://download.pytorch.org/whl/xpu --extra-index-url https://pypi.org/simple
+```
+
 ## Why
 
 The int4 leaf machinery was copy-pasted across the FLUX.2 / LTX-2.3 / FireRed /
@@ -56,13 +62,35 @@ fixups (e.g. FireRed/Qwen-Image RoPE tables that meta-init leaves uninitialised)
 
 | backend | kernel | I/O dtype | when |
 |---|---|---|---|
-| `gemlite` | GemLite Triton int4 | fp16 only | large M (FLUX), if installed |
-| `fused` | bundled Triton dequant+GEMM | fp16/bf16/fp32 | default; bf16-safe |
+| `gemlite` | GemLite Triton int4 | fp16 only | CUDA large M (FLUX), if installed |
+| `fused` | bundled Triton dequant+GEMM | fp16/bf16/fp32 | CUDA/XPU default; bf16-safe |
 | `eager` | dequant once to `nn.Linear` | any | groupsize≠32, actorder, odd shapes |
 
-`backend="auto"` → gemlite if importable, else fused. **bf16 is the safe default**
-for Qwen-Image / LTX (fp16 overflows to NaN); fp16 is only required on the
-GemLite path.
+`backend="auto"` → CUDA uses GemLite if importable, else fused; XPU uses fused;
+CPU and non-Triton devices fall back to eager. **bf16 is the safe default** for
+Qwen-Image / LTX (fp16 overflows to NaN); fp16 is only required on the GemLite
+path.
+
+## XPU / Triton-XPU
+
+XPU support uses the same `FusedInt4Linear` Triton source as CUDA and dispatches
+it on tensors placed on `xpu`. The runtime now avoids CUDA-only assumptions in
+backend selection and warmup:
+
+```python
+model = load_int4_model(
+    "model.safetensors",
+    build_meta_model,
+    device="xpu:0",
+    dtype="bfloat16",
+    backend="auto",   # resolves to fused on XPU
+)
+```
+
+GemLite is intentionally CUDA-only here; requesting `backend="gemlite"` on XPU
+raises a clear error. The bundled fused kernel has separate CUDA/XPU launch
+heuristics, and XPU warmup autotunes each requested `M` bucket from a small set
+of tile candidates before caching the fastest config.
 
 ## Checkpoint contract
 

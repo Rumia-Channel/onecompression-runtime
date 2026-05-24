@@ -14,7 +14,14 @@ Copyright 2025-2026 Kizuna Intelligence / Fujitsu Ltd. MIT License.
 """
 from __future__ import annotations
 
-from . import backend, quant_utils
+from . import backend, device, quant_utils
+from .device import (
+    accelerator_available,
+    ensure_device_available,
+    supports_gemlite,
+    supports_triton,
+    synchronize,
+)
 from .diffusion import load_int4_model
 from .layers import (
     FusedInt4Linear,
@@ -41,6 +48,12 @@ __all__ = [
     "PackedInt4Conv1d",
     "PackedInt4ConvTranspose1d",
     "replace_conv_with_packed",
+    "accelerator_available",
+    "ensure_device_available",
+    "supports_gemlite",
+    "supports_triton",
+    "synchronize",
     "backend",
+    "device",
     "quant_utils",
 ]

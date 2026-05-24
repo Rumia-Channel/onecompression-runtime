@@ -41,6 +41,7 @@ import torch
 from safetensors import safe_open
 
 from .backend import build_quant_layer, resolve_backend, resolve_dtype
+from .device import ensure_device_available, supports_triton, synchronize
 from .layers.fused_int4_linear import FusedInt4Linear
 from .layers.gemlite_int4_linear import GemLiteInt4Linear
 
@@ -65,12 +66,12 @@ def load_int4_model(
         build_meta_model: ``(config_dict) -> nn.Module``. Called inside a
             ``torch.device("meta")`` context; should construct the bare model
             from the config (e.g. ``SomeTransformer.from_config(cfg)``).
-        device: target device, e.g. ``"cuda:0"``.
+        device: target device, e.g. ``"cuda:0"`` or ``"xpu:0"``.
         dtype: compute dtype for non-quantized tensors (bf16 recommended;
             fp16 only on the gemlite path, and never for Qwen-Image/LTX which
             overflow to NaN).
-        backend: ``"auto"`` (gemlite if importable, else fused), ``"gemlite"``,
-            ``"fused"``, or ``"eager"``.
+        backend: ``"auto"`` (CUDA: gemlite if importable, else fused; XPU:
+            fused), ``"gemlite"``, ``"fused"``, or ``"eager"``.
         use_fused: legacy switch; ``False`` forces the eager-dequant fallback.
         post_load: optional ``(model) -> None`` hook run after weights are
             loaded — for per-model buffer fixups (rope tables, etc.).
@@ -81,9 +82,9 @@ def load_int4_model(
     Returns:
         an ``eval``-mode ``nn.Module`` on ``device``.
     """
-    backend = resolve_backend(backend, use_fused)
     resolved = resolve_dtype(dtype)
-    dev = torch.device(device)
+    dev = ensure_device_available(device)
+    backend = resolve_backend(backend, use_fused, dev)
     path = Path(checkpoint_path)
 
     with safe_open(str(path), framework="pt", device="cpu") as f:
@@ -159,7 +160,7 @@ def load_int4_model(
           f"(gemlite={counts['gemlite']}, fused={counts['fused']}, "
           f"eager={counts['eager']}) on {dev}")
 
-    if warmup and dev.type == "cuda":
+    if warmup and supports_triton(dev):
         t0 = time.perf_counter()
         seen: dict[tuple, Any] = {}
         for m in model.modules():
@@ -168,7 +169,7 @@ def load_int4_model(
         if seen:
             for layer in seen.values():
                 layer.warmup(m_values=warmup_m_values)
-            torch.cuda.synchronize(dev)
+            synchronize(dev)
             print(f"[{label}] warmup {(time.perf_counter()-t0)*1000:.0f} ms "
                   f"({len(seen)} unique signatures)")
     return model
